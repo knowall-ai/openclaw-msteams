@@ -1,0 +1,9 @@
+{
+  "id": "msteams-user",
+  "channels": ["msteams-user"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

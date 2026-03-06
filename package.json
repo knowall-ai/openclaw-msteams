@@ -1,0 +1,31 @@
+{
+  "name": "@knowall-ai/openclaw-msteams",
+  "version": "0.1.0",
+  "description": "OpenClaw Microsoft Teams channel plugin (User Account via Graph API)",
+  "type": "module",
+  "dependencies": {
+    "@azure/msal-node": "^2.x",
+    "express": "^5.x"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "msteams-user",
+      "label": "Microsoft Teams (User)",
+      "selectionLabel": "Microsoft Teams (User Account)",
+      "docsPath": "/channels/msteams-user",
+      "docsLabel": "msteams-user",
+      "blurb": "Graph API; messages as your M365 user account.",
+      "aliases": [
+        "teams-user"
+      ],
+      "order": 61
+    },
+    "install": {
+      "npmSpec": "@knowall-ai/openclaw-msteams",
+      "defaultChoice": "npm"
+    }
+  }
+}

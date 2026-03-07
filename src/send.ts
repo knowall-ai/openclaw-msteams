@@ -44,15 +44,25 @@ async function resolveChatId(
   if (userMatch) {
     const email = userMatch[1]!.trim();
 
-    // First, look up the user's ID
-    const userResp = await fetch(
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
-    if (!userResp.ok) {
-      throw new Error(`Failed to resolve user ${email}: ${userResp.status}`);
+    // Resolve both the target user's ID and the authenticated user's ID
+    const [targetResp, meResp] = await Promise.all([
+      fetch(
+        `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      ),
+      fetch(
+        `https://graph.microsoft.com/v1.0/me?$select=id`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      ),
+    ]);
+    if (!targetResp.ok) {
+      throw new Error(`Failed to resolve user ${email}: ${targetResp.status}`);
     }
-    const user = (await userResp.json()) as { id: string };
+    if (!meResp.ok) {
+      throw new Error(`Failed to resolve authenticated user: ${meResp.status}`);
+    }
+    const targetUser = (await targetResp.json()) as { id: string };
+    const meUser = (await meResp.json()) as { id: string };
 
     // Create or get existing 1:1 chat
     const chatResp = await fetch("https://graph.microsoft.com/v1.0/chats", {
@@ -67,13 +77,12 @@ async function resolveChatId(
           {
             "@odata.type": "#microsoft.graph.aadUserConversationMember",
             roles: ["owner"],
-            "user@odata.bind": `https://graph.microsoft.com/v1.0/users('${user.id}')`,
+            "user@odata.bind": `https://graph.microsoft.com/v1.0/users('${targetUser.id}')`,
           },
           {
             "@odata.type": "#microsoft.graph.aadUserConversationMember",
             roles: ["owner"],
-            // "me" — the authenticated user (Sallie)
-            "user@odata.bind": "https://graph.microsoft.com/v1.0/me",
+            "user@odata.bind": `https://graph.microsoft.com/v1.0/users('${meUser.id}')`,
           },
         ],
       }),

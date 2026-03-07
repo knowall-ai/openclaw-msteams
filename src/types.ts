@@ -23,6 +23,8 @@ export type MSTeamsUserConfig = {
     port?: number;
     clientState?: string;
     path?: string;
+    /** Full public URL base (e.g. https://sallie.knowall.ai). */
+    url?: string;
   };
   dmPolicy?: "open" | "allowlist" | "pairing";
   allowFrom?: Array<string | number>;

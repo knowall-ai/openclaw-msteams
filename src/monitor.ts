@@ -133,7 +133,7 @@ export async function startMonitor(opts: MonitorOpts): Promise<MonitorResult> {
   if (creds.userId) {
     const subOpts: SubscriptionManagerOpts = {
       creds,
-      webhookUrl: `https://${getHostname(opts.cfg)}${webhookPath}`,
+      webhookUrl: `${getWebhookBaseUrl(opts.cfg, channelCfg)}${webhookPath}`,
       clientState,
       log,
     };
@@ -215,14 +215,38 @@ async function dispatchToOpenClaw(
 }
 
 /**
- * Extract the public hostname from config for the webhook URL.
+ * Build the public webhook base URL from config or environment.
+ *
+ * Priority:
+ *   1. channels.msteams-user.webhook.url (explicit full URL)
+ *   2. WEBHOOK_URL env var (used by existing graph-subscriptions)
+ *   3. WEBHOOK_HOST env var + https://
+ *   4. ui.hostname from config + https://
  */
-function getHostname(cfg: OpenClawConfig): string {
-  // Try ui.hostname, then fall back to environment
-  const hostname =
-    (cfg as any).ui?.hostname ||
-    process.env.WEBHOOK_HOST ||
-    process.env.HOSTNAME ||
-    "localhost";
-  return hostname;
+function getWebhookBaseUrl(cfg: OpenClawConfig, channelCfg?: MSTeamsUserConfig): string {
+  // Explicit webhook URL from channel config
+  const configUrl = (channelCfg?.webhook as any)?.url;
+  if (configUrl) return configUrl.replace(/\/$/, "");
+
+  // WEBHOOK_URL from environment (same as graph-subscriptions uses)
+  if (process.env.WEBHOOK_URL) {
+    // WEBHOOK_URL may include a path — strip it to get just the base
+    try {
+      const parsed = new URL(process.env.WEBHOOK_URL);
+      return `${parsed.protocol}//${parsed.host}`;
+    } catch {
+      return process.env.WEBHOOK_URL.replace(/\/$/, "");
+    }
+  }
+
+  // WEBHOOK_HOST
+  if (process.env.WEBHOOK_HOST) {
+    return `https://${process.env.WEBHOOK_HOST}`;
+  }
+
+  // ui.hostname from config
+  const hostname = (cfg as any).ui?.hostname;
+  if (hostname) return `https://${hostname}`;
+
+  return "https://localhost";
 }

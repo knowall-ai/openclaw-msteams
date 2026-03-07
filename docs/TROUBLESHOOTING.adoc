@@ -1,0 +1,238 @@
+= Troubleshooting Guide
+:toc:
+:toc-placement!:
+
+Common issues and their resolutions for the OpenClaw MS Teams User channel plugin.
+
+toc::[]
+
+== Quick Diagnostics
+
+Run these commands to check the plugin state:
+
+[source,bash]
+----
+# Channel status
+openclaw channels status msteams-user
+
+# Check logs for errors
+journalctl -u openclaw | grep msteams-user | tail -20
+
+# Webhook health check
+curl http://localhost:3978/health
+----
+
+== Common Issues
+
+[cols="1,2", options="header"]
+|===
+| Problem | Solution
+
+| "credentials not configured"
+| Ensure `clientId`, `tenantId`, and `userId` are set in `channels.msteams-user` config or as `MS365_MCP_*` environment variables.
+
+| "no cached token"
+| Run `openclaw channels login msteams-user` to complete device-code login.
+
+| "token refresh failed"
+| Refresh token expired (~90 days). Re-run `openclaw channels login msteams-user`.
+
+| "HOOKS_TOKEN not set"
+| Add `HOOKS_TOKEN=<value>` to the OpenClaw service environment file or systemd unit.
+
+| Plugin not loading
+| Check `plugins.entries` in `openclaw.json` points to the correct plugin path.
+
+| "plugin id mismatch" warning
+| Cosmetic warning from OpenClaw when entry file is named `index.ts`. Plugin functions normally.
+|===
+
+== Authentication Issues
+
+=== Device-Code Login Fails
+
+**Symptom:** Login command hangs or returns an error.
+
+**Causes:**
+
+1. **Wrong client ID or tenant ID**: Verify the Azure AD app registration details.
++
+[source,bash]
+----
+# Check config
+cat ~/.openclaw/openclaw.json | grep -A5 msteams-user
+----
+
+2. **Insufficient permissions**: The app needs `Chat.ReadWrite`, `ChatMessage.Send`, `User.Read` (delegated).
++
+Check in Azure Portal → App registrations → API permissions.
+
+3. **Admin consent not granted**: A tenant admin must grant consent for delegated permissions.
+
+=== Token Refresh Fails After Working Previously
+
+**Symptom:** Status shows "token refresh failed — re-run device-code login".
+
+**Causes:**
+
+* Refresh token expired (inactive for ~90 days)
+* App registration permissions changed
+* User password changed or account disabled
+
+**Fix:** Re-run `openclaw channels login msteams-user`.
+
+== Webhook Issues
+
+=== "NotificationUrl references a local address"
+
+**Symptom:** Subscription creation fails with error 400.
+
+**Cause:** The webhook URL resolved to `localhost` or an internal IP. Microsoft Graph requires a public HTTPS URL.
+
+**Fix:** Set the `webhook.url` in your config:
+
+[source,json]
+----
+{
+  "channels": {
+    "msteams-user": {
+      "webhook": {
+        "url": "https://your-public-domain.com"
+      }
+    }
+  }
+}
+----
+
+Or set the `WEBHOOK_URL` environment variable.
+
+=== Notifications Not Arriving
+
+**Symptom:** Messages sent to the agent in Teams don't trigger any log activity.
+
+**Checklist:**
+
+1. **Subscription exists**: Check logs for "Subscription created" after startup.
+2. **Reverse proxy configured**: Ensure your proxy forwards `/webhooks/*` to the plugin port.
++
+[source,bash]
+----
+# Test external access
+curl -v https://your-domain.com/webhooks/graph
+----
+
+3. **Port conflict**: Another service may be using the configured port.
++
+[source,bash]
+----
+ss -tlnp | grep 3978
+----
+
+4. **Firewall rules**: Ensure Microsoft's IP ranges can reach your server on port 443.
+
+=== Subscription Expires / Not Renewed
+
+**Symptom:** Notifications stop after ~60 minutes.
+
+**Cause:** The renewal timer may not be running, or renewal is failing.
+
+**Check:**
+
+[source,bash]
+----
+journalctl -u openclaw | grep -i "renew\|renewal"
+----
+
+**Fix:** Restart OpenClaw — subscriptions are recreated on startup.
+
+== Message Sending Issues
+
+=== "'user@odata.bind' field is missing"
+
+**Symptom:** Error when sending to `user:<email>` target.
+
+**Cause:** Graph API requires actual user IDs (not `/me`) in `user@odata.bind` when creating chats.
+
+**Fix:** This was fixed in the plugin. Ensure you're running the latest version.
+
+=== "Graph API send failed: 403"
+
+**Symptom:** Message sending returns 403 Forbidden.
+
+**Causes:**
+
+* Missing `ChatMessage.Send` permission
+* User doesn't have Teams license
+* Teams policies restrict messaging
+
+**Fix:** Verify the user has a Teams license and the app has correct permissions.
+
+== Inbound Processing Issues
+
+=== Agent Not Responding to Messages
+
+**Symptom:** Notifications arrive (logs show "Received N notification(s)") but agent doesn't reply.
+
+**Checklist:**
+
+1. **HOOKS_TOKEN**: Check logs for "HOOKS_TOKEN not set — cannot dispatch to OpenClaw".
++
+[source,bash]
+----
+journalctl -u openclaw | grep "HOOKS_TOKEN"
+----
++
+**Fix:** Add `HOOKS_TOKEN` to the service environment.
+
+2. **Self-message filtering**: If the sender's user ID matches `userId` in config, the message is ignored.
+
+3. **Debounce**: Messages within 10 seconds of the previous notification from the same chat are debounced.
+
+4. **Meeting chat filter**: Messages from meeting chats (IDs containing `meeting_`) are silently dropped.
+
+5. **Allow-list**: If `dmPolicy` is `allowlist`, only emails in `allowFrom` are processed.
+
+=== Duplicate Responses
+
+**Symptom:** Agent replies multiple times to the same message.
+
+**Cause:** Multiple subscriptions may be active (e.g. from both this plugin and a separate graph-adapter).
+
+**Fix:** Disable any other webhook processors for the same Graph resources:
+
+[source,bash]
+----
+# List all Graph subscriptions for the user
+# (requires Graph Explorer or a script)
+----
+
+== Performance Issues
+
+=== Slow Notification Processing
+
+**Symptom:** Agent takes many seconds to respond after a Teams message.
+
+**Causes:**
+
+* Token refresh happening on each notification
+* Slow Graph API responses for sender/context enrichment
+* OpenClaw processing delay
+
+**Mitigation:** The plugin fetches sender info and recent messages in parallel to minimize latency.
+
+== Log Reference
+
+Key log prefixes to filter:
+
+[cols="1,2", options="header"]
+|===
+| Prefix | Description
+
+| `[msteams-user]` | General plugin messages
+| `[msteams-user:debug]` | Verbose debug output (notifications, validation)
+| `msteams-user: starting monitor` | Monitor startup
+| `Subscription created` | Graph subscription lifecycle
+| `Dispatched to OpenClaw` | Successful wake call
+| `HOOKS_TOKEN not set` | Missing auth for wake endpoint
+| `Failed to create subscription` | Subscription creation error
+|===

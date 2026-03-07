@@ -1,0 +1,250 @@
+= Deployment Guide
+:toc:
+:toc-placement!:
+
+This document describes how to deploy the OpenClaw MS Teams User channel plugin.
+
+toc::[]
+
+== Prerequisites
+
+* OpenClaw instance (running or installable)
+* Node.js 18+
+* Azure AD app registration with the following **delegated** permissions:
+  ** `Chat.ReadWrite`
+  ** `ChatMessage.Send`
+  ** `ChannelMessage.Send`
+  ** `User.Read`
+  ** `Chat.Read`
+  ** `User.ReadBasic.All`
+* A publicly accessible HTTPS endpoint for Graph webhook notifications
+
+== Azure App Registration
+
+=== Create the App
+
+1. Go to https://portal.azure.com[Azure Portal] → App registrations → New registration
+2. Name: e.g. "OpenClaw Teams User"
+3. Supported account types: "Accounts in this organizational directory only"
+4. Redirect URI: leave blank (device-code flow doesn't need one)
+5. Note the **Application (client) ID** and **Directory (tenant) ID**
+
+=== Configure Permissions
+
+1. Go to **API permissions** → Add a permission
+2. Select **Microsoft Graph** → **Delegated permissions**
+3. Add the permissions listed in Prerequisites above
+4. Click **Grant admin consent** (requires admin role)
+
+=== Optional: Client Secret
+
+If using confidential client flow:
+
+1. Go to **Certificates & secrets** → New client secret
+2. Note the secret value (only shown once)
+3. Store securely (e.g. environment variable or secret manager)
+
+NOTE: For most deployments, only `clientId` and `tenantId` are needed. The device-code flow uses a public client, which doesn't require a client secret.
+
+== Installation
+
+=== From npm
+
+[source,bash]
+----
+openclaw plugins install @knowall-ai/openclaw-msteams
+----
+
+=== From Source (Development)
+
+Clone and link the plugin:
+
+[source,bash]
+----
+git clone https://github.com/knowall-ai/openclaw-msteams.git
+cd openclaw-msteams
+npm install
+openclaw plugins install --link ./index.ts
+----
+
+== Configuration
+
+Add the channel configuration to your `openclaw.json`:
+
+[source,json]
+----
+{
+  "channels": {
+    "msteams-user": {
+      "enabled": true,
+      "clientId": "your-azure-app-client-id",
+      "tenantId": "your-azure-tenant-id",
+      "userId": "user-object-id-from-azure-ad",
+      "webhook": {
+        "port": 3978,
+        "clientState": "your-shared-secret",
+        "url": "https://your-public-domain.com"
+      },
+      "dmPolicy": "allowlist",
+      "allowFrom": ["user@example.com"],
+      "defaultTo": "user@example.com"
+    }
+  }
+}
+----
+
+=== Configuration Fields
+
+[cols="1,1,2", options="header"]
+|===
+| Field | Required | Description
+
+| `enabled` | No | Enable/disable the channel (default: `true`)
+| `clientId` | Yes | Azure AD app registration client ID
+| `clientSecret` | No | Client secret (supports `{ "$secret": "ENV_VAR" }` syntax)
+| `tenantId` | Yes | Azure AD tenant ID
+| `userId` | Yes | The M365 user's Azure AD object ID (for subscriptions)
+| `webhook.port` | No | Local HTTP port for webhook server (default: `3978`)
+| `webhook.clientState` | No | Shared secret for Graph webhook validation
+| `webhook.url` | Yes | Public HTTPS base URL for webhook notifications
+| `webhook.path` | No | Webhook endpoint path (default: `/webhooks/graph`)
+| `dmPolicy` | No | DM policy: `open`, `allowlist`, or `pairing` (default: `pairing`)
+| `allowFrom` | No | List of allowed sender emails (when policy is `allowlist`)
+| `defaultTo` | No | Default message target
+|===
+
+=== Finding Your User Object ID
+
+[source,bash]
+----
+# Via Azure CLI
+az ad user show --id user@example.com --query id -o tsv
+
+# Via Graph Explorer
+# GET https://graph.microsoft.com/v1.0/me?$select=id
+----
+
+=== Environment Variables
+
+The plugin also checks environment variables as fallbacks:
+
+[cols="1,2", options="header"]
+|===
+| Variable | Description
+
+| `MS365_MCP_CLIENT_ID` | Fallback for `clientId`
+| `MS365_MCP_TENANT_ID` | Fallback for `tenantId`
+| `MS365_MCP_CLIENT_SECRET` | Fallback for `clientSecret`
+| `MS365_USER_ID` | Fallback for `userId`
+| `HOOKS_TOKEN` | Auth token for OpenClaw `/hooks/wake` endpoint
+| `WEBHOOK_URL` | Fallback for `webhook.url`
+| `WEBHOOK_HOST` | Fallback (uses `https://{WEBHOOK_HOST}`)
+|===
+
+== Authentication (First-Time Login)
+
+After installing and configuring, run the device-code login:
+
+[source,bash]
+----
+openclaw channels login msteams-user
+----
+
+This will display a URL and code. Visit the URL in a browser, enter the code, and sign in with the M365 user account.
+
+The token is cached at `~/.openclaw/msteams-user-token-cache.json` and auto-renews silently (refresh tokens last ~90 days).
+
+== Reverse Proxy
+
+The webhook server needs to be accessible from the internet. Configure your reverse proxy to forward webhook traffic:
+
+=== Caddy Example
+
+[source]
+----
+your-domain.com {
+    route /webhooks/msteams-user {
+        reverse_proxy localhost:3978
+    }
+
+    # ... other routes
+}
+----
+
+=== Nginx Example
+
+[source,nginx]
+----
+location /webhooks/msteams-user {
+    proxy_pass http://localhost:3978/webhooks/graph;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+----
+
+IMPORTANT: The webhook URL must be publicly accessible via HTTPS. Microsoft Graph will reject `http://` or `localhost` notification URLs.
+
+== Systemd Service
+
+If running OpenClaw as a systemd service, ensure `HOOKS_TOKEN` is available in the service environment:
+
+[source,ini]
+----
+[Service]
+Environment=HOOKS_TOKEN=your-hooks-token-here
+----
+
+Or add it to an environment file loaded by the service:
+
+[source]
+----
+# /home/agent/.openclaw/env
+HOOKS_TOKEN=your-hooks-token-here
+----
+
+== Verification
+
+After deployment, verify the plugin is working:
+
+[source,bash]
+----
+# Check channel status
+openclaw channels status msteams-user
+
+# Expected output:
+# Microsoft Teams (User) default: enabled, configured, running, works
+----
+
+=== Health Check
+
+The plugin exposes a health endpoint:
+
+[source,bash]
+----
+curl http://localhost:3978/health
+# {"status":"ok","channel":"msteams-user"}
+----
+
+== Production Considerations
+
+=== Subscription Resilience
+
+Teams chat subscriptions expire after 60 minutes. The plugin auto-renews every 50 minutes. After a restart, subscriptions are recreated automatically.
+
+=== Token Refresh
+
+Delegated auth tokens renew silently using cached refresh tokens. If the refresh token expires (~90 days without use), re-run `openclaw channels login msteams-user`.
+
+=== Firewall
+
+Ensure your server allows inbound HTTPS traffic on port 443 (or your configured port) from Microsoft's IP ranges.
+
+=== Monitoring
+
+Monitor the OpenClaw logs for `[msteams-user]` entries:
+
+[source,bash]
+----
+journalctl -u openclaw -f | grep msteams-user
+----

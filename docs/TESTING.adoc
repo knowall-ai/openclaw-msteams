@@ -1,0 +1,194 @@
+= Testing Guide
+:toc:
+:toc-placement!:
+
+This document describes how to test the OpenClaw MS Teams User channel plugin.
+
+toc::[]
+
+== Prerequisites
+
+* OpenClaw instance running with the plugin installed
+* Azure AD app registration configured (see link:DEPLOYMENT.adoc[Deployment Guide])
+* Completed device-code login (`openclaw channels login msteams-user`)
+* Public HTTPS endpoint accessible for webhooks
+
+== Channel Status Check
+
+Verify the plugin is loaded and connected:
+
+[source,bash]
+----
+openclaw channels status msteams-user
+----
+
+Expected output:
+
+[source]
+----
+Microsoft Teams (User) default: enabled, configured, running, works
+----
+
+If the probe fails, check:
+
+* Credentials are configured correctly in `openclaw.json`
+* Device-code login was completed
+* Token cache exists at `~/.openclaw/msteams-user-token-cache.json`
+
+== Outbound Testing (Sending Messages)
+
+=== Send via CLI
+
+[source,bash]
+----
+openclaw channels send msteams-user user:recipient@example.com "Hello from OpenClaw!"
+----
+
+=== Send via Dashboard
+
+1. Open the OpenClaw dashboard
+2. Navigate to Chat
+3. Select the `msteams-user` channel
+4. Enter target: `user:recipient@example.com`
+5. Send a message
+
+=== Verify
+
+* The message should appear in the recipient's Teams chat
+* The message should appear as sent by the authenticated M365 user (not a bot)
+
+== Inbound Testing (Receiving Messages)
+
+=== Test Webhook Endpoint
+
+Verify the webhook server is running:
+
+[source,bash]
+----
+curl http://localhost:3978/health
+# {"status":"ok","channel":"msteams-user"}
+----
+
+=== Test Subscription
+
+Check that the Graph subscription is active:
+
+[source,bash]
+----
+# Look for subscription creation in logs
+journalctl -u openclaw | grep "Subscription created"
+----
+
+=== End-to-End Receive Test
+
+1. Send a Teams message to the agent's M365 user account
+2. Check logs for notification processing:
++
+[source,bash]
+----
+journalctl -u openclaw -f | grep msteams-user
+----
++
+Expected log entries:
++
+[source]
+----
+[msteams-user:debug] Received 1 notification(s)
+[msteams-user] Dispatched to OpenClaw [person:sender@example.com]
+----
+
+3. The agent should process and reply to the message
+
+== Manual Testing Checklist
+
+=== Authentication
+
+[cols="1,2,1", options="header"]
+|===
+| Test | Steps | Expected Result
+
+| Device-code login
+| Run `openclaw channels login msteams-user`
+| Displays URL and code; login succeeds
+
+| Token refresh
+| Restart OpenClaw after login
+| Token refreshes silently (no re-login needed)
+
+| Probe
+| Run `openclaw channels status msteams-user`
+| Shows "works" with authenticated user name
+|===
+
+=== Outbound
+
+[cols="1,2,1", options="header"]
+|===
+| Test | Steps | Expected Result
+
+| Send to known user
+| Send message to `user:email@example.com`
+| Message appears in recipient's Teams
+
+| Send to chat ID
+| Send message to a raw chat ID (`19:xxx@thread.v2`)
+| Message appears in the Teams chat
+
+| Long message chunking
+| Send a message >4000 characters
+| Message is split into multiple chunks
+
+| HTML content
+| Send message with Markdown formatting
+| Rendered correctly in Teams
+|===
+
+=== Inbound
+
+[cols="1,2,1", options="header"]
+|===
+| Test | Steps | Expected Result
+
+| 1:1 message
+| Send DM to the agent in Teams
+| Agent receives and processes the message
+
+| Self-message filter
+| Agent sends a message (triggers notification)
+| Notification is filtered (no echo loop)
+
+| Debounce
+| Send multiple messages rapidly
+| Only the first triggers processing (10s window)
+
+| Subscription renewal
+| Wait 50+ minutes after startup
+| Subscription renewed in logs
+
+| Subscription recreation
+| Restart OpenClaw
+| New subscription created on startup
+|===
+
+=== Security
+
+[cols="1,2,1", options="header"]
+|===
+| Test | Steps | Expected Result
+
+| Allow-list enforcement
+| Send from unlisted email with `dmPolicy: allowlist`
+| Message ignored (not dispatched)
+
+| Invalid clientState
+| Forge a notification with wrong clientState
+| Notification rejected in logs
+
+| Open policy warning
+| Set `dmPolicy: open` in config
+| Security warning shown in status
+|===
+
+== Troubleshooting Tests
+
+See link:TROUBLESHOOTING.adoc[Troubleshooting Guide] for common issues and their resolutions.

@@ -1,0 +1,146 @@
+= Solution Design
+:toc:
+:toc-placement!:
+
+Architecture and design of the OpenClaw MS Teams User channel plugin.
+
+toc::[]
+
+== Overview
+
+The `openclaw-msteams` plugin enables OpenClaw agents to send and receive Microsoft Teams messages *as a real M365 user account* — not a bot. It uses Microsoft Graph API with delegated authentication, so messages appear naturally in Teams as sent by the user.
+
+This contrasts with the official `@openclaw/msteams` plugin which uses Azure Bot Framework, where messages come from a bot identity.
+
+[source]
+----
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  MS Graph API   │────▶│  Plugin Monitor  │────▶│    OpenClaw     │
+│  Webhooks       │     │  (Express :3978) │     │    Gateway      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+        ▲                                               │
+        │                                               ▼
+┌─────────────────┐                            ┌─────────────────┐
+│  Teams Client   │◀───────────────────────────│  Outbound Send  │
+│                 │     Graph API POST          │  (Delegated)    │
+└─────────────────┘     /chats/{id}/messages   └─────────────────┘
+----
+
+== Components
+
+=== Entry Point (`index.ts`)
+
+Registers the plugin with OpenClaw using `api.registerChannel()`. Follows the standard plugin registration pattern.
+
+=== Channel Definition (`src/channel.ts`)
+
+Implements the `ChannelPlugin` interface with the following adapters:
+
+[cols="1,2", options="header"]
+|===
+| Adapter | Purpose
+
+| `config` | Single-account model. Resolves credentials from `channels.msteams-user` config.
+| `pairing` | Allow-list management. Normalises email-based identifiers.
+| `security` | Warns when `dmPolicy` is set to `open`.
+| `setup` | Account setup (enable/disable).
+| `messaging` | Target normalisation (`user:<email>` format).
+| `directory` | Lists peers from `allowFrom` config.
+| `outbound` | Sends messages via Graph API with delegated auth.
+| `status` | Probes health via Graph API `/me` call.
+| `gateway` | Starts the inbound webhook server and subscription lifecycle.
+| `auth` | Device-code login flow for delegated auth.
+|===
+
+=== Authentication (`src/auth.ts`)
+
+Uses MSAL `PublicClientApplication` with device-code flow:
+
+1. **First login**: User visits a URL and enters a code (one-time setup)
+2. **Token cache**: Persisted to `~/.openclaw/msteams-user-token-cache.json`
+3. **Silent renewal**: Refresh tokens last ~90 days; renewed automatically
+4. **Scopes**: `Chat.ReadWrite`, `ChatMessage.Send`, `ChannelMessage.Send`, `User.Read`, `Chat.Read`, `User.ReadBasic.All`
+
+=== Outbound (`src/outbound.ts`, `src/send.ts`)
+
+Sends messages via `POST /chats/{chatId}/messages` with delegated auth.
+
+Target resolution:
+
+* `user:<email>` — Finds or creates a 1:1 chat with the target user
+* `19:xxx@thread.v2` — Direct chat ID (used for replies)
+
+Messages are chunked as Markdown with a 4000-character limit per chunk.
+
+=== Inbound (`src/monitor.ts`, `src/inbound.ts`)
+
+Express server receives Graph webhook notifications:
+
+1. **Validation**: Responds to Graph subscription validation requests (`?validationToken=`)
+2. **Notification processing**: Validates `clientState`, enriches sender info, fetches context
+3. **Session routing**: `person:<email>` for 1:1 chats, `group:<chatId>` for group chats
+4. **Dispatch**: Forwards to OpenClaw via `/hooks/wake` with `HOOKS_TOKEN` auth
+
+=== Subscriptions (`src/subscriptions.ts`)
+
+Manages Graph webhook subscription lifecycle:
+
+* **Resource**: `/users/{userId}/chats/getAllMessages`
+* **Expiry**: Teams chat subscriptions expire in 60 minutes
+* **Auto-renewal**: Timer runs every 50 minutes, renews existing and recreates missing
+* **Resilience**: Missing subscriptions detected and recreated on each renewal cycle
+
+== Data Flow
+
+=== Sending a Message (Outbound)
+
+[source]
+----
+1. OpenClaw agent replies via Chat UI or skill
+2. Outbound adapter receives (to, text)
+3. Target resolved: user:<email> → Graph API /users lookup → /chats POST
+4. Message sent: POST /chats/{chatId}/messages (delegated auth)
+5. Message appears in Teams as the authenticated user
+----
+
+=== Receiving a Message (Inbound)
+
+[source]
+----
+1. User sends Teams message to the agent's account
+2. MS Graph sends webhook notification to plugin monitor
+3. Monitor validates clientState, responds 202
+4. Inbound processor fetches sender info + recent context
+5. Self-messages and debounced duplicates filtered
+6. Wake call dispatched to OpenClaw with session routing
+7. OpenClaw session processes and replies via outbound
+----
+
+== Key Design Decisions
+
+1. **Delegated auth over Bot Framework**: Messages appear as a real user, not a bot identity
+2. **Device-code flow**: One-time interactive login; tokens persist ~90 days
+3. **Express webhook server**: Lightweight HTTP server handles Graph notifications
+4. **Debounce (10s)**: Prevents notification storms from rapid message sequences
+5. **Meeting chat filtering**: Noisy meeting notifications are silently dropped
+6. **Session routing**: Conversation-based routing ensures context continuity
+
+== Security Considerations
+
+* **DM Policy**: Supports `open`, `allowlist`, and `pairing` modes
+* **Allow-list**: Only approved senders can trigger the agent (when policy is `allowlist`)
+* **Client state validation**: Webhook notifications must include the shared secret
+* **Token isolation**: Separate token cache from other Graph auth to avoid conflicts
+
+== Limitations
+
+* Teams chat subscriptions expire after 60 minutes (auto-renewed)
+* Device-code login requires interactive browser access (one-time)
+* Media attachments are included as links, not native Teams attachments
+* Teams channel messages (as opposed to chat messages) require additional subscription types
+
+== Related
+
+* https://learn.microsoft.com/en-us/graph/api/subscription-post-subscriptions[MS Graph Subscriptions API]
+* https://learn.microsoft.com/en-us/graph/api/chat-post-messages[MS Graph Chat Messages API]
+* https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code[Device Code Flow]

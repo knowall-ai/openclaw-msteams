@@ -1,20 +1,25 @@
 /**
- * Inbound webhook server — receives Graph API notification POSTs.
+ * Inbound webhook server — receives Graph API notification POSTs and
+ * dispatches through OpenClaw's channel reply pipeline.
  *
- * Handles:
- *   1. Subscription validation (responds with validationToken)
- *   2. Notification processing (validates clientState, dispatches to inbound)
- *   3. Subscription lifecycle (create + auto-renew timer)
+ * Previously dispatched via HTTP /hooks/wake. Now uses the SDK's
+ * core.channel.reply.dispatchReplyFromConfig() for proper session
+ * routing, reply delivery, and agent invocation.
  */
 
 import type { Server } from "node:http";
-import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
-import { keepHttpServerTaskAlive } from "openclaw/plugin-sdk";
-import { processNotification } from "./inbound.js";
+import type { OpenClawConfig, ReplyPayload, RuntimeEnv } from "openclaw/plugin-sdk";
+import {
+  keepHttpServerTaskAlive,
+  DEFAULT_ACCOUNT_ID,
+  createReplyPrefixOptions,
+} from "openclaw/plugin-sdk";
+import { getRuntime } from "./runtime.js";
+import { processNotification, type InboundMessage } from "./inbound.js";
+import { sendGraphMessage } from "./send.js";
 import {
   buildSubscriptions,
   createSubscription,
-  renewAll,
   startRenewalTimer,
   type SubscriptionManagerOpts,
 } from "./subscriptions.js";
@@ -32,13 +37,219 @@ export type MonitorResult = {
   shutdown: () => Promise<void>;
 };
 
+type Logger = {
+  info: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  debug: (...args: unknown[]) => void;
+};
+
+function getChannelCfg(cfg: OpenClawConfig): MSTeamsUserConfig | undefined {
+  return (cfg.channels as any)?.["msteams-user"];
+}
+
+/**
+ * Dispatch an inbound message through the OpenClaw channel reply pipeline.
+ *
+ * Follows the same pattern as the official msteams/mattermost plugins:
+ *   1. resolveAgentRoute → session key
+ *   2. enqueueSystemEvent → heartbeat notification
+ *   3. formatInboundEnvelope → formatted message body
+ *   4. finalizeInboundContext → full context payload
+ *   5. createReplyDispatcherWithTyping → reply delivery mechanism
+ *   6. dispatchReplyFromConfig → invoke LLM and deliver reply
+ */
+async function dispatchInbound(
+  message: InboundMessage,
+  cfg: OpenClawConfig,
+  channelCfg: MSTeamsUserConfig,
+  log: Logger,
+): Promise<void> {
+  const core = getRuntime();
+  const accountId = DEFAULT_ACCOUNT_ID;
+  const chatId = message.chatId!;
+  const chatType = message.chatType === "oneOnOne" ? ("direct" as const) : ("group" as const);
+
+  // DM policy check
+  const dmPolicy = channelCfg.dmPolicy ?? "pairing";
+  if (chatType === "direct" && dmPolicy !== "open") {
+    const allowFrom = (channelCfg.allowFrom ?? []).map((e) =>
+      String(e).trim().toLowerCase(),
+    );
+    if (allowFrom.length > 0 && message.senderEmail) {
+      if (!allowFrom.includes(message.senderEmail.toLowerCase())) {
+        log.debug(`Sender ${message.senderEmail} not in allowlist, dropping`);
+        return;
+      }
+    } else if (dmPolicy === "allowlist" && allowFrom.length === 0) {
+      log.debug("DM policy is allowlist but no entries configured, dropping");
+      return;
+    }
+  }
+
+  // 1. Route resolution
+  const peerId =
+    chatType === "direct"
+      ? (message.senderEmail ?? message.senderId ?? chatId)
+      : chatId;
+  const route = core.channel.routing.resolveAgentRoute({
+    cfg,
+    channel: "msteams-user",
+    accountId,
+    peer: { kind: chatType, id: peerId },
+  });
+  const sessionKey = route.sessionKey;
+
+  // 2. Record activity
+  core.channel.activity.record({
+    channel: "msteams-user",
+    accountId,
+    direction: "inbound",
+  });
+
+  // 3. System event (visible in heartbeat)
+  const preview = (message.rawText || "").replace(/\s+/g, " ").slice(0, 160);
+  const senderLabel = message.senderName ?? message.senderEmail ?? "someone";
+  const inboundLabel =
+    chatType === "direct"
+      ? `Teams DM from ${senderLabel}`
+      : `Teams group message from ${senderLabel}`;
+  core.system.enqueueSystemEvent(`${inboundLabel}: ${preview}`, {
+    sessionKey,
+    contextKey: `msteams-user:message:${chatId}:${message.messageId ?? "unknown"}`,
+  });
+
+  // 4. Format inbound envelope
+  const fromLabel =
+    chatType === "direct"
+      ? message.senderName
+        ? `${message.senderName} (${message.senderEmail ?? ""})`
+        : (message.senderEmail ?? "unknown")
+      : `${senderLabel} in group`;
+  const body = core.channel.reply.formatInboundEnvelope({
+    channel: "Microsoft Teams",
+    from: fromLabel,
+    body: message.text,
+    chatType,
+    sender: {
+      name: message.senderName ?? undefined,
+      id: message.senderId ?? undefined,
+    },
+  });
+
+  // 5. Finalize inbound context
+  const to = chatId;
+  const ctxPayload = core.channel.reply.finalizeInboundContext({
+    Body: body,
+    BodyForAgent: message.rawText || message.text,
+    RawBody: message.rawText || "",
+    From:
+      chatType === "direct"
+        ? `msteams-user:${message.senderEmail ?? message.senderId ?? chatId}`
+        : `msteams-user:group:${chatId}`,
+    To: to,
+    SessionKey: sessionKey,
+    AccountId: route.accountId,
+    ChatType: chatType,
+    ConversationLabel: fromLabel,
+    SenderName: message.senderName ?? undefined,
+    SenderId: message.senderId ?? undefined,
+    Provider: "msteams-user" as const,
+    Surface: "msteams-user" as const,
+    MessageSid: message.messageId ?? undefined,
+    OriginatingChannel: "msteams-user" as const,
+    OriginatingTo: to,
+  });
+
+  // 6. Update last route for DMs (so replies route back to this channel)
+  if (chatType === "direct") {
+    const sessionCfg = (cfg as any).session;
+    const storePath = core.channel.session.resolveStorePath(
+      sessionCfg?.store,
+      { agentId: route.agentId },
+    );
+    await core.channel.session.updateLastRoute({
+      storePath,
+      sessionKey: route.mainSessionKey,
+      deliveryContext: {
+        channel: "msteams-user",
+        to,
+        accountId: route.accountId,
+      },
+    });
+  }
+
+  // 7. Create reply dispatcher with deliver callback
+  const textLimit = core.channel.text.resolveTextChunkLimit(
+    cfg,
+    "msteams-user",
+    accountId,
+    { fallbackLimit: 4000 },
+  );
+
+  const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
+    cfg,
+    agentId: route.agentId,
+    channel: "msteams-user",
+    accountId,
+  });
+
+  const { dispatcher, replyOptions, markDispatchIdle } =
+    core.channel.reply.createReplyDispatcherWithTyping({
+      ...prefixOptions,
+      humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId),
+      deliver: async (payload: ReplyPayload) => {
+        const text = payload.text ?? "";
+        if (!text.trim()) return;
+
+        const chunkMode = core.channel.text.resolveChunkMode(
+          cfg,
+          "msteams-user",
+          accountId,
+        );
+        const chunks = core.channel.text.chunkMarkdownTextWithMode(
+          text,
+          textLimit,
+          chunkMode,
+        );
+        for (const chunk of chunks.length > 0 ? chunks : [text]) {
+          if (!chunk) continue;
+          await sendGraphMessage({
+            channelCfg,
+            to,
+            text: chunk,
+          });
+        }
+        log.info(`Delivered reply to ${to}`);
+      },
+      onError: (err: unknown, info: { kind: string }) => {
+        log.error(`Reply delivery failed (${info.kind}):`, err);
+      },
+    });
+
+  // 8. Dispatch through LLM and deliver reply
+  await core.channel.reply.withReplyDispatcher({
+    dispatcher,
+    onSettled: () => markDispatchIdle(),
+    run: () =>
+      core.channel.reply.dispatchReplyFromConfig({
+        ctx: ctxPayload,
+        cfg,
+        dispatcher,
+        replyOptions: {
+          ...replyOptions,
+          onModelSelected,
+        },
+      }),
+  });
+}
+
 /**
  * Start the inbound webhook monitor.
  *
- * This is called by gateway.startAccount when OpenClaw starts.
+ * Called by gateway.startAccount when OpenClaw starts.
  */
 export async function startMonitor(opts: MonitorOpts): Promise<MonitorResult> {
-  const channelCfg = opts.cfg.channels?.["msteams-user"] as MSTeamsUserConfig | undefined;
+  const channelCfg = getChannelCfg(opts.cfg);
 
   if (!channelCfg?.enabled) {
     return { app: null, shutdown: async () => {} };
@@ -55,10 +266,10 @@ export async function startMonitor(opts: MonitorOpts): Promise<MonitorResult> {
   const webhookPath = channelCfg.webhook?.path ?? "/webhooks/graph";
   const ignoreUserId = creds.userId;
 
-  const log = {
-    info: (...args: unknown[]) => opts.runtime?.log?.(`[msteams-user] ${args.join(" ")}`),
-    error: (...args: unknown[]) => opts.runtime?.error?.(`[msteams-user] ${args.join(" ")}`),
-    debug: (...args: unknown[]) => opts.runtime?.log?.(`[msteams-user:debug] ${args.join(" ")}`),
+  const log: Logger = {
+    info: (...args) => opts.runtime?.log?.(`[msteams-user] ${args.join(" ")}`),
+    error: (...args) => opts.runtime?.error?.(`[msteams-user] ${args.join(" ")}`),
+    debug: (...args) => opts.runtime?.log?.(`[msteams-user:debug] ${args.join(" ")}`),
   };
 
   log.info(`Starting monitor on port ${port}`);
@@ -95,8 +306,8 @@ export async function startMonitor(opts: MonitorOpts): Promise<MonitorResult> {
           const message = await processNotification(notification, creds, ignoreUserId);
           if (!message) continue;
 
-          // Dispatch to OpenClaw via /hooks/wake
-          await dispatchToOpenClaw(opts.cfg, message.text, message.sessionKey, log);
+          // Dispatch through SDK channel pipeline
+          await dispatchInbound(message, opts.cfg, channelCfg, log);
         } catch (err) {
           log.error("Notification processing error:", err);
         }
@@ -166,52 +377,6 @@ export async function startMonitor(opts: MonitorOpts): Promise<MonitorResult> {
   });
 
   return { app, shutdown };
-}
-
-/**
- * Dispatch an inbound message to OpenClaw via /hooks/wake.
- */
-async function dispatchToOpenClaw(
-  cfg: OpenClawConfig,
-  text: string,
-  sessionKey: string | null,
-  log: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void },
-): Promise<void> {
-  // Try to find the hooks token from environment
-  const hooksToken = process.env.HOOKS_TOKEN;
-  if (!hooksToken) {
-    log.error("HOOKS_TOKEN not set — cannot dispatch to OpenClaw");
-    return;
-  }
-
-  const openclawUrl = process.env.OPENCLAW_URL ?? "http://localhost:3000";
-
-  const payload: Record<string, unknown> = {
-    text: text.slice(0, 2000),
-    mode: "now",
-  };
-  if (sessionKey) {
-    payload.sessionKey = sessionKey;
-  }
-
-  try {
-    const resp = await fetch(`${openclawUrl}/hooks/wake`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${hooksToken}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (resp.ok) {
-      log.info(`Dispatched to OpenClaw${sessionKey ? ` [${sessionKey}]` : ""}`);
-    } else {
-      log.error(`Wake failed: ${resp.status} — ${await resp.text()}`);
-    }
-  } catch (err) {
-    log.error("Failed to dispatch to OpenClaw:", err);
-  }
 }
 
 /**

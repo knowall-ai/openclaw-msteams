@@ -13,16 +13,24 @@ import { getReadToken } from "./auth.js";
 import type { MSTeamsUserCredentials, GraphNotification } from "./types.js";
 
 export type InboundMessage = {
-  /** Context text for the agent. */
+  /** Context text for the agent (formatted with recent messages). */
   text: string;
+  /** Raw message body text (just the latest message, no formatting). */
+  rawText: string;
   /** Session routing key (person:<email>, group:<chatId>). */
   sessionKey: string | null;
   /** Sender email (for allowlist matching). */
   senderEmail: string | null;
   /** Sender display name. */
   senderName: string | null;
+  /** Sender Azure AD user ID. */
+  senderId: string | null;
   /** Chat ID. */
   chatId: string | null;
+  /** Graph message ID. */
+  messageId: string | null;
+  /** Chat type from Graph API (oneOnOne, group, etc.). */
+  chatType: string | null;
 };
 
 /** Debounce tracking — prevents self-notification loops. */
@@ -91,10 +99,14 @@ export async function processNotification(
     // No token — return generic message
     return {
       text: "New Teams message received. Use the Teams skill to read and respond.",
+      rawText: "",
       sessionKey: null,
       senderEmail: null,
       senderName: null,
+      senderId: null,
       chatId,
+      messageId,
+      chatType: null,
     };
   }
 
@@ -141,10 +153,14 @@ export async function processNotification(
 
   return {
     text,
+    rawText: senderInfo?.rawText ?? "",
     sessionKey,
     senderEmail: senderInfo?.senderEmail ?? null,
     senderName: senderInfo?.senderName ?? null,
+    senderId: senderInfo?.senderId ?? null,
     chatId,
+    messageId,
+    chatType,
   };
 }
 
@@ -154,6 +170,7 @@ type SenderInfo = {
   senderEmail: string | null;
   senderName: string | null;
   senderId: string | null;
+  rawText: string;
 };
 
 async function fetchSenderInfo(
@@ -163,18 +180,20 @@ async function fetchSenderInfo(
 ): Promise<SenderInfo | null> {
   try {
     const resp = await fetch(
-      `https://graph.microsoft.com/v1.0/chats/${chatId}/messages/${messageId}?$select=from`,
+      `https://graph.microsoft.com/v1.0/chats/${chatId}/messages/${messageId}?$select=from,body`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
     if (!resp.ok) return null;
 
     const msg = (await resp.json()) as {
       from?: { user?: { id?: string; displayName?: string } };
+      body?: { content?: string };
     };
     const userId = msg.from?.user?.id ?? null;
     const senderName = msg.from?.user?.displayName ?? null;
+    const rawText = (msg.body?.content ?? "").replace(/<[^>]+>/g, "").trim();
 
-    if (!userId) return { senderEmail: null, senderName, senderId: null };
+    if (!userId) return { senderEmail: null, senderName, senderId: null, rawText };
 
     // Fetch user's email
     const userResp = await fetch(
@@ -182,7 +201,7 @@ async function fetchSenderInfo(
       { headers: { Authorization: `Bearer ${token}` } },
     );
     if (!userResp.ok) {
-      return { senderEmail: null, senderName, senderId: userId };
+      return { senderEmail: null, senderName, senderId: userId, rawText };
     }
 
     const user = (await userResp.json()) as {
@@ -193,6 +212,7 @@ async function fetchSenderInfo(
       senderEmail: user.mail ?? user.userPrincipalName ?? null,
       senderName,
       senderId: userId,
+      rawText,
     };
   } catch {
     return null;

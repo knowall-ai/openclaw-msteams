@@ -37,8 +37,8 @@ curl http://localhost:3978/health
 | "token refresh failed"
 | Refresh token expired (~90 days). Re-run `openclaw channels login msteams-user`.
 
-| "HOOKS_TOKEN not set"
-| Add `HOOKS_TOKEN=<value>` to the OpenClaw service environment file or systemd unit.
+| "Unknown model" / FailoverError
+| The configured model isn't in OpenClaw's model registry. See <<model-not-recognised>>.
 
 | Plugin not loading
 | Check `plugins.entries` in `openclaw.json` points to the correct plugin path.
@@ -175,14 +175,12 @@ journalctl -u openclaw | grep -i "renew\|renewal"
 
 **Checklist:**
 
-1. **HOOKS_TOKEN**: Check logs for "HOOKS_TOKEN not set — cannot dispatch to OpenClaw".
+1. **Model error**: Check for `FailoverError: Unknown model` in logs. If the configured model isn't in OpenClaw's registry, all dispatch fails. See <<model-not-recognised>>.
 +
 [source,bash]
 ----
-journalctl -u openclaw | grep "HOOKS_TOKEN"
+journalctl -u openclaw | grep -i "FailoverError\|Unknown model"
 ----
-+
-**Fix:** Add `HOOKS_TOKEN` to the service environment.
 
 2. **Self-message filtering**: If the sender's user ID matches `userId` in config, the message is ignored.
 
@@ -191,6 +189,13 @@ journalctl -u openclaw | grep "HOOKS_TOKEN"
 4. **Meeting chat filter**: Messages from meeting chats (IDs containing `meeting_`) are silently dropped.
 
 5. **Allow-list**: If `dmPolicy` is `allowlist`, only emails in `allowFrom` are processed.
+
+6. **SDK dispatch error**: Check for errors from the reply pipeline.
++
+[source,bash]
+----
+journalctl -u openclaw | grep -E "msteams-user.*(Reply delivery failed|Notification processing error)"
+----
 
 === Duplicate Responses
 
@@ -205,6 +210,71 @@ journalctl -u openclaw | grep "HOOKS_TOKEN"
 # List all Graph subscriptions for the user
 # (requires Graph Explorer or a script)
 ----
+
+[[model-not-recognised]]
+== Model Not Recognised
+
+**Symptom:** Logs show `FailoverError: Unknown model: openai-codex/<model-name>` and the agent cannot process any requests. Running `openclaw models list` shows the model tagged as `missing`.
+
+**Cause:** OpenClaw's model registry (`models.generated.js` in the `@mariozechner/pi-ai` package) doesn't include the model. This happens when a new model is released (e.g. ChatGPT 5.4) but the upstream package hasn't been updated yet.
+
+**Fix:** Patch the model registry on the VM:
+
+1. Find the `openai-codex` provider section in the models file:
++
+[source,bash]
+----
+grep -n '"openai-codex"' /usr/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/models.generated.js
+----
+
+2. Find the last model entry in the `openai-codex` block (look for the closing `},` before the next provider):
++
+[source,bash]
+----
+# Find the line after the last openai-codex model entry
+grep -n 'provider: "openai-codex"' /usr/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/models.generated.js
+----
+
+3. Insert the new model entry after the last existing model. Use an existing entry as a template, changing `id`, `name`, and `contextWindow`:
++
+[source,javascript]
+----
+"chatgpt-5.4": {
+    id: "chatgpt-5.4",
+    name: "ChatGPT 5.4",
+    api: "openai-codex-responses",
+    provider: "openai-codex",
+    baseUrl: "https://chatgpt.com/backend-api",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: {
+        input: 1.75,
+        output: 14,
+        cacheRead: 0.175,
+        cacheWrite: 0,
+    },
+    contextWindow: 1000000,
+    maxTokens: 128000,
+},
+----
+
+4. Set it as the default and restart:
++
+[source,bash]
+----
+openclaw models set openai-codex/chatgpt-5.4
+sudo systemctl restart openclaw-sallie
+----
+
+5. Verify:
++
+[source,bash]
+----
+openclaw models list
+# Should show: openai-codex/chatgpt-5.4  text+image  977k  ...  default,configured
+----
+
+IMPORTANT: This patch is overwritten when OpenClaw is updated (`npm install -g openclaw`). Re-apply after any update, or create a post-install script.
 
 == Performance Issues
 
@@ -232,7 +302,9 @@ Key log prefixes to filter:
 | `[msteams-user:debug]` | Verbose debug output (notifications, validation)
 | `msteams-user: starting monitor` | Monitor startup
 | `Subscription created` | Graph subscription lifecycle
-| `Dispatched to OpenClaw` | Successful wake call
-| `HOOKS_TOKEN not set` | Missing auth for wake endpoint
+| `Delivered reply to` | Successful reply sent via Graph API
+| `Reply delivery failed` | Reply dispatch error
+| `Sender ... not in allowlist` | DM policy blocked a message
 | `Failed to create subscription` | Subscription creation error
+| `FailoverError: Unknown model` | Model not in registry (see <<model-not-recognised>>)
 |===

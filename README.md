@@ -6,6 +6,8 @@
   </picture>
 </p>
 
+[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/knowall-ai/openclaw-msteams?label=CodeRabbit+Reviews&labelColor=171717&color=FF570A)](https://coderabbit.ai)
+
 Microsoft Teams channel plugin for [OpenClaw](https://openclaw.ai) that sends and receives messages **as a real M365 user account** — not a bot.
 
 **User identity** | **Delegated auth** | **Graph API** | **Webhook subscriptions** | **Open source**
